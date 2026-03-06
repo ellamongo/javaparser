@@ -23,6 +23,7 @@ package com.github.javaparser.symbolsolver.resolution.javaparser.contexts;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -43,10 +44,14 @@ import com.github.javaparser.symbolsolver.javaparsermodel.contexts.CompilationUn
 import com.github.javaparser.symbolsolver.resolution.AbstractResolutionTest;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.JarTypeSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.MemoryTypeSolver;
 import com.github.javaparser.symbolsolver.resolution.typesolvers.ReflectionTypeSolver;
 import com.google.common.collect.ImmutableList;
 import java.io.IOException;
+import java.net.URISyntaxException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -57,6 +62,17 @@ import org.junit.jupiter.api.Test;
 class CompilationUnitContextResolutionTest extends AbstractResolutionTest {
 
     private TypeSolver typeSolver;
+
+    /** Fixture root for static import cycle (works from repo root or module dir). */
+    private static Path fixtureRootForStaticImportCycle() throws URISyntaxException {
+        try {
+            return adaptPath("src/test/resources/static_import_cycle_fixture/app");
+        } catch (IllegalArgumentException e) {
+            return Paths.get(CompilationUnitContextResolutionTest.class.getClassLoader()
+                    .getResource("static_import_cycle_fixture/app")
+                    .toURI());
+        }
+    }
 
     @BeforeEach
     void setup() {
@@ -267,5 +283,31 @@ class CompilationUnitContextResolutionTest extends AbstractResolutionTest {
                         .getType()
                         .asReferenceType()
                         .getQualifiedName());
+    }
+
+    /**
+     * On master (without the cyclic static-import fix), resolving "Lion" in ElephantBuilder's
+     * compilation unit causes unbounded recursion and {@link StackOverflowError} because
+     * ZooTestConstants, ElephantTestConstants, etc. form a cycle via static imports.
+     * This test documents the bug: we expect StackOverflowError until the fix is applied.
+     */
+    @Test
+    void resolveSymbolInElephantBuilderWithCyclicStaticImportsThrowsStackOverflow() throws IOException, URISyntaxException {
+        Path fixtureRoot = fixtureRootForStaticImportCycle();
+        Path testJava = fixtureRoot.resolve("src/test/java");
+        Path mainJava = fixtureRoot.resolve("src/main/java");
+        Path zooSdkStub = fixtureRoot.getParent().resolve("zoo-sdk-stub/src/main/java");
+        CombinedTypeSolver typeSolver = new CombinedTypeSolver();
+        typeSolver.add(new ReflectionTypeSolver());
+        typeSolver.add(new JavaParserTypeSolver(testJava));
+        typeSolver.add(new JavaParserTypeSolver(mainJava));
+        typeSolver.add(new JavaParserTypeSolver(zooSdkStub));
+
+        CompilationUnit cu = parseSampleWithStandardExtension(
+                "static_import_cycle_fixture/app/src/test/java/junit4/zoo/builders/ElephantBuilder",
+                typeSolver);
+
+        assertThrows(StackOverflowError.class,
+                () -> new CompilationUnitContext(cu, typeSolver).solveSymbol("Lion"));
     }
 }
