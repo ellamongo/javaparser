@@ -40,8 +40,10 @@ import com.github.javaparser.resolution.declarations.ResolvedTypeDeclaration;
 import com.github.javaparser.resolution.model.typesystem.ReferenceTypeImpl;
 import com.github.javaparser.resolution.types.ResolvedArrayType;
 import com.github.javaparser.resolution.types.ResolvedType;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Consumer;
 
 /**
@@ -55,6 +57,8 @@ import java.util.function.Consumer;
 public class VarType extends Type {
 
     private static final String JAVA_LANG_OBJECT = Object.class.getCanonicalName();
+
+    private static final ThreadLocal<Set<Node>> RESOLVING_VAR_TYPES = ThreadLocal.withInitial(HashSet::new);
 
     @AllFieldsConstructor
     public VarType() {
@@ -139,39 +143,47 @@ public class VarType extends Type {
         if (!(parent instanceof VariableDeclarator)) {
             throw new IllegalStateException("Trying to resolve a `var` which is not in a variable declaration.");
         }
-        final VariableDeclarator variableDeclarator = (VariableDeclarator) parent;
-        Optional<Expression> initializer = variableDeclarator.getInitializer();
-        if (!initializer.isPresent()) {
-            // When a `var` type decl has no initializer it may be part of a
-            // for-each statement (e.g. `for(var i : expr)`).
-            Optional<ForEachStmt> forEachStmt = forEachStmtWithVariableDeclarator(variableDeclarator);
-            if (forEachStmt.isPresent()) {
-                Expression iterable = forEachStmt.get().getIterable();
-                ResolvedType iterType = iterable.calculateResolvedType();
-                if (iterType instanceof ResolvedArrayType) {
-                    // The type of a variable in a for-each loop with an array
-                    // is the component type of the array.
-                    return ((ResolvedArrayType) iterType).getComponentType();
-                }
-                if (iterType.isReferenceType()) {
-                    // The type of a variable in a for-each loop with an
-                    // Iterable with parameter type
-                    List<ResolvedType> parametersType =
-                            iterType.asReferenceType().typeParametersMap().getTypes();
-                    if (parametersType.isEmpty()) {
-                        Optional<ResolvedTypeDeclaration> oObjectDeclaration =
-                                context.solveType(JAVA_LANG_OBJECT).getDeclaration();
-                        return oObjectDeclaration
-                                .map(decl -> ReferenceTypeImpl.undeterminedParameters(decl.asReferenceType()))
-                                .orElseThrow(() -> new UnsupportedOperationException());
+        Set<Node> resolving = RESOLVING_VAR_TYPES.get();
+        if (!resolving.add(this)) {
+            throw new IllegalStateException("Cyclic var type inference detected");
+        }
+        try {
+            final VariableDeclarator variableDeclarator = (VariableDeclarator) parent;
+            Optional<Expression> initializer = variableDeclarator.getInitializer();
+            if (!initializer.isPresent()) {
+                // When a `var` type decl has no initializer it may be part of a
+                // for-each statement (e.g. `for(var i : expr)`).
+                Optional<ForEachStmt> forEachStmt = forEachStmtWithVariableDeclarator(variableDeclarator);
+                if (forEachStmt.isPresent()) {
+                    Expression iterable = forEachStmt.get().getIterable();
+                    ResolvedType iterType = iterable.calculateResolvedType();
+                    if (iterType instanceof ResolvedArrayType) {
+                        // The type of a variable in a for-each loop with an array
+                        // is the component type of the array.
+                        return ((ResolvedArrayType) iterType).getComponentType();
                     }
-                    return parametersType.get(0);
+                    if (iterType.isReferenceType()) {
+                        // The type of a variable in a for-each loop with an
+                        // Iterable with parameter type
+                        List<ResolvedType> parametersType =
+                                iterType.asReferenceType().typeParametersMap().getTypes();
+                        if (parametersType.isEmpty()) {
+                            Optional<ResolvedTypeDeclaration> oObjectDeclaration =
+                                    context.solveType(JAVA_LANG_OBJECT).getDeclaration();
+                            return oObjectDeclaration
+                                    .map(decl -> ReferenceTypeImpl.undeterminedParameters(decl.asReferenceType()))
+                                    .orElseThrow(() -> new UnsupportedOperationException());
+                        }
+                        return parametersType.get(0);
+                    }
                 }
             }
+            return initializer
+                    .map(Expression::calculateResolvedType)
+                    .orElseThrow(() -> new IllegalStateException("Cannot resolve `var` which has no initializer."));
+        } finally {
+            resolving.remove(this);
         }
-        return initializer
-                .map(Expression::calculateResolvedType)
-                .orElseThrow(() -> new IllegalStateException("Cannot resolve `var` which has no initializer."));
     }
 
     private Optional<ForEachStmt> forEachStmtWithVariableDeclarator(VariableDeclarator variableDeclarator) {
